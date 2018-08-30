@@ -163,6 +163,90 @@ ediff.fonly_protcod$pval = 2*(pnorm(-abs(ediff.fonly_protcod$Z)))
 ediff.fonly_protcod$p.adj = p.adjust(ediff.fonly_protcod$pval,method="BH")
 ```
 
+
+SCDE analysis using assigned clusters from Seurat - male early vs late gonadal
+```{r}
+# define groups to compare based on cluster membership (clusters 1,11,6 = male germ cells from later weeks but early gonadal from previous comparison, cluster 0 = late gonadal cells)
+clust_factors_monly_gonadvlate = clust_factors_monly[which(clust_factors_monly==1)]
+clust_factors_monly_gonadvlate[which(clust_factors_monly_gonadvlate == 1)] = 0
+temp = subset(pgc@meta.data,res.1.2 %in% c(0))[,c("res.1.2")]
+names(temp) = rownames(subset(pgc@meta.data,res.1.2 %in% c(0)))
+temp[which(temp==0)] = 2
+clust_factors_monly_gonadvlate = c(clust_factors_monly_gonadvlate,temp)
+clust_factors_monly_gonadvlate[which(clust_factors_monly_gonadvlate == 1)] = 0
+clust_factors_monly_gonadvlate[which(clust_factors_monly_gonadvlate %in% c(2))] = 1
+
+rawdat_forde_monly = pgc@raw.data[,names(clust_factors_monly_gonadvlate)]
+rawdat_forde_monly<-apply(rawdat_forde_monly,2,function(x) {storage.mode(x) <- 'integer'; x})
+
+cd_monly = clean.counts(rawdat_forde_monly,min.lib.size=1000)
+
+# run SCDE
+o.ifm.monly <- scde.error.models(counts = cd_monly, groups = clust_factors_monly_gonadvlate, n.cores = 8, threshold.segmentation = TRUE, save.crossfit.plots = FALSE, save.model.plots = FALSE, verbose = 0,min.count.threshold = 1)
+valid.cells <- o.ifm.monly$corr.a > 0
+
+o.prior.monly <- scde.expression.prior(models = o.ifm.monly, counts = cd_monly, length.out = 400, show.plot = FALSE)
+ediff.monly.gonadvlate <- scde.expression.difference(o.ifm.monly, cd_monly, o.prior.monly, groups  =  as.factor(clust_factors_monly_gonadvlate), n.randomizations  =  100, n.cores  =  8, verbose  =  1)
+ediff.monly.gonadvlate[,1:6] = -ediff.monly.gonadvlate[,1:6]
+
+# estimate MLE TPMs in early and late gonadal groups
+jp.xy.0.gonadvlate <- scde.posteriors(models = o.ifm.monly[names(clust_factors_monly_gonadvlate[which(clust_factors_monly_gonadvlate == 0)]), ], cd_monly, o.prior.monly, n.cores = 8)
+jp.xy.0.mles.gonadvlate = as.numeric(colnames(jp.xy.0.gonadvlate)[apply(jp.xy.0.gonadvlate, 1, which.max)])
+names(jp.xy.0.mles.gonadvlate) = rownames(jp.xy.0.gonadvlate)
+jp.xy.1.gonadvlate <- scde.posteriors(models = o.ifm.monly[names(clust_factors_monly_gonadvlate[which(clust_factors_monly_gonadvlate == 1)]), ], cd_monly, o.prior.monly, n.cores = 8)
+jp.xy.1.mles.gonadvlate = as.numeric(colnames(jp.xy.1.gonadvlate)[apply(jp.xy.1.gonadvlate, 1, which.max)])
+names(jp.xy.1.mles.gonadvlate) = rownames(jp.xy.1.gonadvlate)
+
+
+ediff.monly.gonadvlate_protcod = ediff.monly.gonadvlate[rownames(ediff.monly.gonadvlate) %in% embl,]
+ediff.monly.gonadvlate_protcod$pval = 2*(pnorm(-abs(ediff.monly.gonadvlate_protcod$Z)))
+ediff.monly.gonadvlate_protcod$p.adj = p.adjust(ediff.monly.gonadvlate_protcod$pval,method="BH")
+
+```
+
+
+SCDE analysis using assigned clusters from Seurat - female early vs late gonadal
+```{r}
+# define groups to compare cluster 2 (all female, later stage embryos but early gonadal from above comparison) to clusters 7,10,13 (late gonadal)
+clust_factors_fonly_gonadvlate = clust_factors_fonly[which(clust_factors_fonly==1)]
+clust_factors_fonly_gonadvlate[which(clust_factors_fonly_gonadvlate == 1)] = 0
+temp = subset(pgc@meta.data,res.1.2 %in% c(7,10,13))[,c("res.1.2")]
+names(temp) = rownames(subset(pgc@meta.data,res.1.2 %in% c(7,10,13)))
+clust_factors_fonly_gonadvlate = c(clust_factors_fonly_gonadvlate,temp)
+clust_factors_fonly_gonadvlate[which(clust_factors_fonly_gonadvlate == 1)] = 0
+clust_factors_fonly_gonadvlate[which(clust_factors_fonly_gonadvlate %in% c(7,10,13))] = 1
+
+rawdat_forde_fonly = pgc@raw.data[,names(clust_factors_fonly_gonadvlate)]
+rawdat_forde_fonly<-apply(rawdat_forde_fonly,2,function(x) {storage.mode(x) <- 'integer'; x})
+
+cd_fonly = clean.counts(rawdat_forde_fonly,min.lib.size=1000)
+
+# run SCDE for differential expression
+o.ifm.fonly <- scde.error.models(counts = cd_fonly, groups = clust_factors_fonly_gonadvlate, n.cores = 8, threshold.segmentation = TRUE, save.crossfit.plots = FALSE, save.model.plots = FALSE, verbose = 1,min.count.threshold = 1)
+valid.cells <- o.ifm.fonly$corr.a > 0
+group_factors_fonly_gonadvlate = clust_factors_fonly_gonadvlate[rownames(o.ifm.fonly)]
+
+o.prior.fonly <- scde.expression.prior(models = o.ifm.fonly, counts = cd_fonly, length.out = 400, show.plot = FALSE)
+ediff.fonly.gonadvlate <- scde.expression.difference(o.ifm.fonly, cd_fonly, o.prior.fonly, groups  =  as.factor(clust_factors_fonly_gonadvlate), n.randomizations  =  100, n.cores  =  8, verbose  =  1)
+ediff.fonly.gonadvlate[,1:6] = -ediff.fonly.gonadvlate[,1:6]
+
+
+# estimate MLE TPM in early and late gonadal groups
+jp.xx.0.gonadvlate <- scde.posteriors(models = o.ifm.fonly[names(clust_factors_fonly_gonadvlate[which(clust_factors_fonly_gonadvlate == 0)]), ], cd_fonly, o.prior.fonly, n.cores = 8)
+jp.xx.0.mles.gonadvlate = as.numeric(colnames(jp.xx.0.gonadvlate)[apply(jp.xx.0.gonadvlate, 1, which.max)])
+names(jp.xx.0.mles.gonadvlate) = rownames(jp.xx.0.gonadvlate)
+jp.xx.1.gonadvlate <- scde.posteriors(models = o.ifm.fonly[names(clust_factors_fonly_gonadvlate[which(clust_factors_fonly_gonadvlate == 1)]), ], cd_fonly, o.prior.fonly, n.cores = 8)
+jp.xx.1.mles.gonadvlate = as.numeric(colnames(jp.xx.1.gonadvlate)[apply(jp.xx.1.gonadvlate, 1, which.max)])
+names(jp.xx.1.mles.gonadvlate) = rownames(jp.xx.1.gonadvlate)
+
+
+ediff.fonly.gonadvlate_protcod = ediff.fonly.gonadvlate[rownames(ediff.fonly.gonadvlate) %in% embl,]
+ediff.fonly.gonadvlate_protcod$pval = 2*(pnorm(-abs(ediff.fonly.gonadvlate_protcod$Z)))
+ediff.fonly.gonadvlate_protcod$p.adj = p.adjust(ediff.fonly.gonadvlate_protcod$pval,method="BH")
+
+```
+
+
 calculate germ cell specificity from SCDE posteriors of germ cells vs somatic cells
 ```{r}
 gc_sc_mf_labels = subset(pgc@meta.data,res.1.2 %in% c(1,2,5,3,4,7,10,13,11,6))[,c("res.1.2")]
