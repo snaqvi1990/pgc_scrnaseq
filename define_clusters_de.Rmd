@@ -1,0 +1,204 @@
+---
+title: "define_clusters_de.Rmd"
+author: "Sahin Naqvi"
+date: "10/30/2017"
+output: html_document
+---
+
+
+Starting from a raw counts matrix, use Seurat to perform filtering, normalization, PCA, and clustering of single cells. Use tSNE for visualization
+```{r}
+library(Seurat)
+library(dplyr)
+library(Matrix)
+
+rawdat = data.matrix(read.delim("alldat.noembryo.countmat.txt",header=TRUE,stringsAsFactors = FALSE,row.names = 1))
+
+#filter for minimum numbers of genes/UMIs detected
+pgc = CreateSeuratObject(raw.data = rawdat, min.cells = 20, min.genes = 2000, project = "PGC")
+VlnPlot(object = pgc, features.plot = c("nGene", "nUMI"), nCol = 2)
+pgc = FilterCells(object = pgc, subset.names = c("nGene","nUMI"), low.thresholds = c(2000,100000), high.thresholds = c(Inf,Inf))
+
+#convert Run IDs to age-based IDs
+new2old.ident = read.table("run_info.short.txt",header = TRUE,stringsAsFactors = FALSE,sep="\t")
+pgc@ident <- plyr::mapvalues(x = pgc@ident, from = new2old.ident$Run_s, to = new2old.ident$developmental_stage_s)
+pgc@meta.data$orig.ident = plyr::mapvalues(x = pgc@meta.data$orig.ident, from = new2old.ident$Run_s, to = new2old.ident$developmental_stage_s)
+pgc <- StashIdent(pgc, save.name = "Embryo_Age")
+pgc@meta.data$tp.ident = gsub(" week","",pgc@meta.data$orig.ident)
+
+#normalize count matrix
+pgc <- NormalizeData(object = pgc, normalization.method = "LogNormalize",scale.factor = 500000) #skip if starting with log-normalized TPM values
+pgc <- FindVariableGenes(object = pgc, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 2, y.cutoff = 2,do.plot = TRUE)
+length(x=pgc@var.genes)
+
+# Run PCA, choosing number of significant PCs via jackstraw analysis
+pgc <- ScaleData(object = pgc, vars.to.regress = c("nUMI"))
+pgc <- RunPCA(object = pgc, pc.genes = pgc@var.genes, do.print = FALSE, genes.print = 5,pcs.compute = 25)
+pgc <- JackStraw(object = pgc, num.replicate = 200, do.print = FALSE,num.pc = 25)
+JackStrawPlot(object = pgc, PCs = 1:25)
+PCElbowPlot(pgc,num.pc = 25)
+
+#define clusters and perform tSNE based on chosen PCs
+pgc <- FindClusters(object = pgc, reduction.type = "pca", dims.use = 1:19, resolution = 1.2, print.output = 0, save.SNN = TRUE)
+pgc <- RunTSNE(object = pgc, dims.use = 1:19, do.fast = TRUE)
+
+plot1 = TSNEPlot(object=pgc,do.label = T,do.return=T)
+plot2 = TSNEPlot(object=pgc,do.label = F,do.return=T,group.by="tp.ident")
+multiplot(plot1,plot2,cols=2)
+
+# sum the expression of Y-linked genes
+ygenes = c("DAZ1", "DAZ2", "DAZ3", "DAZ4", "DDX3Y", "EIF1AY", "UTY", "KDM5D", "ZFY", "RPS4Y2", "RPS4Y1", "RBMY1A1", "RBMY1B", "RBMY1D", "RBMY1E", "RBMY1F", "RBMY1J")
+pgc@data = rbind(pgc@data,apply(pgc@data[intersect(rownames(pgc@data),ygenes),],2,sum))
+rownames(pgc@data)[nrow(pgc@data)] = "YSUM"
+
+# change features.plot to plot expression patterns for a desired list of genes
+plot3 = FeaturePlot(object = pgc, features.plot = c("WT1","NANOG","FIGLA","POU5F1"), cols.use = c("grey", "blue"), reduction.use = "tsne",do.return = T)
+```
+
+
+SCDE analysis using assigned clusters from Seurat - male pre- vs post-entry into genital ridge
+```{r}
+library(scde)
+# define groups to compare based on cluster membership (cluster 5 = week 4/5 male and female germ cells, clusters 1,11,6 = male germ cells from later weeks)
+clust_factors = subset(pgc@meta.data,res.1.2 %in% c(5,11,1,6))[,c("res.1.2")]
+clust_factors[which(clust_factors %in% c(5))] = 0
+clust_factors[which(clust_factors %in% c(1,11,6))] = 1
+clust_factors = factor(clust_factors)
+names(clust_factors) = rownames(subset(pgc@meta.data,res.1.2 %in% c(5,11,1,6)))
+
+rawdat_forde = pgc@raw.data[,names(clust_factors)]
+rawdat_forde<-apply(rawdat_forde,2,function(x) {storage.mode(x) <- 'integer'; x})
+
+cd = clean.counts(rawdat_forde,min.lib.size=1000, min.reads = 1, min.detected = 1)
+
+cd_tpm = t((t(cd)/apply(cd,2,sum))*100000)
+ygenes = c("DAZ1","DAZ2","DAZ3","DAZ4","DDX3Y","EIF1AY","UTY","KDM5D","ZFY","RPS4Y2","RPS4Y1","RBMY1A1","RBMY1B","RBMY1D","RBMY1E","RBMY1F","RBMY1J")
+
+# further refine cluster membership, excluding cells with low NANOG (not pluripotent) or any WT1 (somatic) expression
+clust_factors = clust_factors[setdiff(names(clust_factors),names(cd_tpm["WT1",which(cd_tpm["WT1",] > 0)]))] 
+clust_factors = clust_factors[setdiff(names(clust_factors),names(cd_tpm["NANOG",which(cd_tpm["NANOG",] < 5)]))]
+
+# only analyze male cells (this only serves to remove female cells from cluster 5)
+ysum_tpm = apply(cd_tpm[intersect(rownames(cd_tpm),ygenes),],2,sum)
+clust_factors_monly = clust_factors[names(ysum_tpm[which(ysum_tpm >= 10)])]
+
+cd_monly = cd[,names(clust_factors_monly)]
+
+o.ifm <- scde.error.models(counts = cd_monly, groups = clust_factors_monly, n.cores = 8, threshold.segmentation = TRUE, save.crossfit.plots = FALSE, save.model.plots = FALSE, verbose = 0,min.count.threshold = 1)
+valid.cells <- o.ifm$corr.a > 0
+
+group_factors_monly = clust_factors_monly[rownames(o.ifm)]
+
+o.prior <- scde.expression.prior(models = o.ifm, counts = cd_monly, length.out = 400, show.plot = FALSE)
+ediff <- scde.expression.difference(o.ifm, cd_monly, o.prior, groups  =  group_factors_monly, n.randomizations  =  100, n.cores  =  8, verbose  =  1)
+
+# use posterior estimates of cluster-wide expression to get a list of genes expressed > 1 TPM in human PGCs
+jp <- scde.posteriors(models = o.ifm[names(clust_factors_monly[which(clust_factors_monly == 0)]), ], cd_monly, o.prior, n.cores = 8)
+jp.mles = as.numeric(colnames(jp)[apply(jp, 1, which.max)])
+names(jp.mles) = rownames(jp)
+jp.1 <- scde.posteriors(models = o.ifm[names(clust_factors_monly[which(clust_factors_monly == 1)]), ], cd_monly, o.prior, n.cores = 8)
+jp.1.mles = as.numeric(colnames(jp.1)[apply(jp.1, 1, which.max)])
+names(jp.1.mles) = rownames(jp.1)
+humanpgc_expr = names(jp.mles[which(jp.mles > 1)])
+
+cd_monly_tpm = cd_tpm[,names(group_factors_monly[which(!is.na(group_factors_monly))])]
+clust_1_11_6_fracexpr = apply(cd_monly_tpm[,names(group_factors_monly)[which(group_factors_monly==1)]] >1,1,sum)/length(which(group_factors_monly==1))
+
+# get a list of protein-coding genes from the human annotation used
+include_excep = c("GOLGA2P3Y","GOLGA2P2Y","CSPG4P4Y","CSPG4P3Y") #exceptions to include that are annotated as pseudogenes
+embl <- read.table("gencode.v24.annotation.basic_ccds_nopar.gene_tx_annotable.txt", sep = "\t", header = TRUE,stringsAsFactors = FALSE)
+embl = subset(embl, (transcript_type == 'protein_coding'))
+gene_chr_pre = unique(embl[,c("gene_name","seqname")])
+embl <- unique(embl$gene_name)
+embl <- c(as.character(as.matrix(embl)),include_excep)
+  
+# subset the SCDE results to only include protein-coding genes
+ediff_protcod = ediff[rownames(ediff) %in% embl,]
+ediff_protcod$pval = 2*(pnorm(-abs(ediff_protcod$Z)))
+ediff_protcod$p.adj = p.adjust(ediff_protcod$pval,method="BH")
+```
+
+
+SCDE analysis using assigned clusters from Seurat - female pre- vs post-entry into genital ridge
+```{r}
+# first split cells into groups corresponding to clusters 5 (male/female week 4/5 embryos) and cluster 2 (all female, later stage embryos)
+clust_factors_fonly = subset(pgc@meta.data,res.1.2 %in% c(2,5))[,c("res.1.2")]
+clust_factors_fonly[which(clust_factors_fonly %in% c(5))] = 0
+clust_factors_fonly[which(clust_factors_fonly %in% c(2))] = 1
+clust_factors_fonly = factor(clust_factors_fonly)
+names(clust_factors_fonly) = rownames(subset(pgc@meta.data,res.1.2 %in% c(2,5)))
+clust_factors_fonly = clust_factors_fonly[setdiff(names(clust_factors_fonly),names(clust_factors_monly))]
+
+rawdat_forde_fonly = pgc@raw.data[,names(clust_factors_fonly)]
+rawdat_forde_fonly<-apply(rawdat_forde_fonly,2,function(x) {storage.mode(x) <- 'integer'; x})
+
+cd_fonly = clean.counts(rawdat_forde_fonly,min.lib.size=1000, min.reads = 1, min.detected = 1)
+cd_fonly_tpm = t((t(cd_fonly)/apply(cd_fonly,2,sum))*100000)
+
+ysum_fonly_tpm = apply(cd_fonly_tpm[intersect(rownames(cd_fonly_tpm),ygenes),],2,sum)
+
+#filter out male and week 4 cells
+clust_factors_fonly = clust_factors_fonly[names(ysum_fonly_tpm[which(ysum_fonly_tpm < 1)])]
+clust_factors_fonly[which(!grepl("SRR4199308",names(clust_factors_fonly)))] = 1
+
+#filter out NANOG low or WT1-positive cells
+clust_factors_fonly = clust_factors_fonly[setdiff(names(clust_factors_fonly),names(cd_tpm["WT1",which(cd_tpm["WT1",] > 0)]))] 
+clust_factors_fonly = clust_factors_fonly[setdiff(names(clust_factors_fonly),names(cd_tpm["NANOG",which(cd_tpm["NANOG",] < 5)]))]
+
+
+cd_fonly = cd_fonly[,names(clust_factors_fonly)]
+cd_fonly_tpm = cd_fonly_tpm[,names(clust_factors_fonly)]
+
+o.ifm.fonly <- scde.error.models(counts = cd_fonly, groups = clust_factors_fonly, n.cores = 8, threshold.segmentation = TRUE, save.crossfit.plots = FALSE, save.model.plots = FALSE, verbose = 0,min.count.threshold = 1)
+valid.cells <- o.ifm.fonly$corr.a > 0
+
+group_factors_fonly = clust_factors_fonly[rownames(o.ifm.fonly)]
+
+o.prior.fonly <- scde.expression.prior(models = o.ifm.fonly, counts = cd_fonly, length.out = 400, show.plot = FALSE)
+ediff.fonly <- scde.expression.difference(o.ifm.fonly, cd_fonly, o.prior.fonly, groups  =  group_factors_fonly, n.randomizations  =  100, n.cores  =  32, verbose  =  1)
+ediff.fonly[,1:6] = -ediff.fonly[,1:6]
+
+ediff.fonly_protcod = ediff.fonly[rownames(ediff.fonly) %in% embl,]
+ediff.fonly_protcod$pval = 2*(pnorm(-abs(ediff.fonly_protcod$Z)))
+ediff.fonly_protcod$p.adj = p.adjust(ediff.fonly_protcod$pval,method="BH")
+```
+
+calculate germ cell specificity from SCDE posteriors of germ cells vs somatic cells
+```{r}
+gc_sc_mf_labels = subset(pgc@meta.data,res.1.2 %in% c(1,2,5,3,4,7,10,13,11,6))[,c("res.1.2")]
+names(gc_sc_mf_labels) = rownames(subset(pgc@meta.data,res.1.2 %in% c(1,2,5,3,4,7,10,13,11,6)))
+
+# divide cells into male germ cells, male somatic cells, female somatic cells, and female germ cells on the basis of assigned clusters
+gc_sc_mf_labels[which((gc_sc_mf_labels %in% c(1,6,11))&(names(gc_sc_mf_labels) %in% colnames(rawdat_tpm_filt)[which(rawdat_tpm_filt["WT1",] == 0)]))] = "GCm"
+gc_sc_mf_labels[which((gc_sc_mf_labels %in% c(4))&(names(gc_sc_mf_labels) %in% colnames(rawdat_tpm_filt)[which(rawdat_tpm_filt["WT1",] > 0)]))] = "SCm"
+gc_sc_mf_labels[which((gc_sc_mf_labels %in% c(2,5,7,10,13))&(names(gc_sc_mf_labels) %in% colnames(rawdat_tpm_filt)[which(rawdat_tpm_filt["WT1",] == 0)]))] = "GCf"
+gc_sc_mf_labels[which((gc_sc_mf_labels %in% c(3))&(names(gc_sc_mf_labels) %in% colnames(rawdat_tpm_filt)[which(rawdat_tpm_filt["WT1",] > 0)]))] = "SCf"
+gc_sc_mf_labels = gc_sc_mf_labels[which(gc_sc_mf_labels %in% c("GCm","SCm","GCf","SCf"))]
+
+
+# run SCDE considering all 4 clusters simultaneously
+rawdat_gcsc = pgc@raw.data[,names(gc_sc_mf_labels)]
+rawdat_gcsc<-apply(rawdat_gcsc,2,function(x) {storage.mode(x) <- 'integer'; x})
+cd_gcsc = clean.counts(rawdat_gcsc,min.lib.size=1000, min.reads = 1, min.detected = 1)
+o.ifm.gcsc <- scde.error.models(counts = cd_gcsc, groups = gc_sc_mf_labels, n.cores = 8, threshold.segmentation = TRUE, save.crossfit.plots = FALSE, save.model.plots = FALSE, verbose = 0,min.count.threshold = 1)
+valid.cells <- o.ifm.gcsc$corr.a > 0
+
+#extract posterior expression MLEs for each group
+o.prior.gcsc <- scde.expression.prior(models = o.ifm.gcsc, counts = cd_gcsc, length.out = 400, show.plot = FALSE)
+gcm_p <- scde.posteriors(models = o.ifm.gcsc[names(gc_sc_mf_labels[which(gc_sc_mf_labels == "GCm")]), ], cd_gcsc, o.prior.gcsc, n.cores = 8)
+scm_p <- scde.posteriors(models = o.ifm.gcsc[names(gc_sc_mf_labels[which(gc_sc_mf_labels == "SCm")]), ], cd_gcsc, o.prior.gcsc, n.cores = 8)
+gcf_p <- scde.posteriors(models = o.ifm.gcsc[names(gc_sc_mf_labels[which(gc_sc_mf_labels == "GCf")]), ], cd_gcsc, o.prior.gcsc, n.cores = 8)
+scf_p <- scde.posteriors(models = o.ifm.gcsc[names(gc_sc_mf_labels[which(gc_sc_mf_labels == "SCf")]), ], cd_gcsc, o.prior.gcsc, n.cores = 8)
+gcm_p.mles = as.numeric(colnames(gcm_p)[apply(gcm_p, 1, which.max)])
+names(gcm_p.mles) = rownames(gcm_p)
+scm_p.mles = as.numeric(colnames(scm_p)[apply(scm_p, 1, which.max)])
+names(scm_p.mles) = rownames(scm_p)
+gcf_p.mles = as.numeric(colnames(gcf_p)[apply(gcf_p, 1, which.max)])
+names(gcf_p.mles) = rownames(gcf_p)
+scf_p.mles = as.numeric(colnames(scf_p)[apply(scf_p, 1, which.max)])
+names(scf_p.mles) = rownames(scf_p)
+
+# calculate germ cell specificity as the expression MLE in germ cells divided by the summed expression MLE in germ and somatic cells
+gc_male_spec_mle = gcm_p.mles/(gcm_p.mles+scm_p.mles)
+gc_female_spec_mle = gcf_p.mles/(gcf_p.mles+scf_p.mles)
+```
